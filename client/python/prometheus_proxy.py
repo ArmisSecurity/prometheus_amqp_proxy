@@ -8,10 +8,14 @@ import prometheus_client
 
 # TODO: Add prometheus counters in this file.
 CLOSE_EVENT_TIMEOUT_SECONDS = 5
+DEFAULT_HEARTBEAT_INTERVAL_SECS = 5
+PROCESS_DATA_EVEMTS_LIMIT = 0.1
+
 
 class _PrometheusMetricsServer(threading.Thread):
 
-    def __init__(self, connection_params, exchange, routing_key, exclusive):
+    def __init__(self, connection_params, exchange, routing_key, exclusive, 
+                 use_heartbeat_thread=True, heartbeat_interval=DEFAULT_HEARTBEAT_INTERVAL_SECS):
         super().__init__()
         self._connection_params = connection_params
         self._exchange = exchange
@@ -23,6 +27,8 @@ class _PrometheusMetricsServer(threading.Thread):
         # Connecting in ctor, so that an exception will be raised in case of bad parameters.
         self._connect()
         self._running = True
+        self._heartbeat_interval = heartbeat_interval
+        self._use_heartbeat_thread = use_heartbeat_thread
 
     def stop(self):
         try:
@@ -33,6 +39,8 @@ class _PrometheusMetricsServer(threading.Thread):
             self._close_event.set()
 
     def run(self):
+        if self._use_heartbeat_thread:
+            self._start_heartbeat_thread()
         while self._running:
             try:
                 if not self._connection.is_open:
@@ -60,6 +68,24 @@ class _PrometheusMetricsServer(threading.Thread):
                 prometheus_client.generate_latest(prometheus_client.REGISTRY),
                 pika.BasicProperties(correlation_id=props.correlation_id),
             )
+
+    def _start_heartbeat_thread(self):
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            daemon=True,
+            name="prometheus_proxy.heartbeat",
+        )
+        self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self):
+        while self._running:
+            if self._connection.is_open:
+                try:
+                    self._connection.process_data_events(PROCESS_DATA_EVEMTS_LIMIT)
+                except:
+                    logging.exception("failed processing data events")
+            self._close_event.wait(timeout=self._heartbeat_interval)
+
 
 
 def start_amqp_server(connection_params, exchange, routing_key, exclusive=True):
